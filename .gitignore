@@ -1,10 +1,14 @@
-# Dependencies
-node_modules/
-
 # macOS-specific files.
 .DS_Store
 
-# We want to keep the template clean from the usual build artifacts.
-# We also don't want to ship these ignore rules to the users.
-template/app/migrations
-template/app/package-lock.json
+# Ignore all dotenv files by default to prevent accidentally committing any secrets.
+# To include specific dotenv files, use the `!` operator or adjust these rules.
+.env
+.env.*
+
+# Don't ignore example dotenv files.
+!.env.example
+!.env.*.example
+
+# Backup files
+*-2026-*
