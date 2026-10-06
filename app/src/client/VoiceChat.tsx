@@ -24,7 +24,7 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
 
   const [agentState, setAgentState] = useState<'initializing' | 'idle' | 'listening' | 'thinking' | 'speaking'>('idle');
   const [userState, setUserState] = useState<'speaking' | 'listening' | 'away'>('listening');
-  const [isMuted, setIsMuted] = useState(false);
+  const [micError, setMicError] = useState<string>('');
   const [transcripts, setTranscripts] = useState<Array<{ id: string; speaker: 'user' | 'agent'; text: string; timestamp: Date }>>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -32,23 +32,35 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
   // Auto-enable microphone and unblock audio on connect
   useEffect(() => {
     if (localParticipant) {
-      localParticipant.setMicrophoneEnabled(true).catch((err) => {
-        console.warn('Microphone permission request:', err);
-      });
-      setIsMuted(false);
+      localParticipant
+        .setMicrophoneEnabled(true)
+        .then(() => {
+          setMicError('');
+        })
+        .catch((err: any) => {
+          console.warn('Microphone permission request:', err);
+          setMicError(err?.message || 'Microphone could not be enabled');
+        });
     }
     if (room) {
       room.startAudio().catch(() => {});
     }
   }, [localParticipant, room]);
 
+  const isMicMuted = localParticipant ? !localParticipant.isMicrophoneEnabled : false;
+
   const toggleMute = async () => {
     if (localParticipant) {
-      const targetState = !isMuted;
-      await localParticipant.setMicrophoneEnabled(!targetState);
-      setIsMuted(targetState);
-      if (room) {
-        await room.startAudio().catch(() => {});
+      try {
+        const currentlyEnabled = localParticipant.isMicrophoneEnabled;
+        await localParticipant.setMicrophoneEnabled(!currentlyEnabled);
+        setMicError('');
+        if (!currentlyEnabled && room) {
+          await room.startAudio().catch(() => {});
+        }
+      } catch (err: any) {
+        console.error('Toggle mic error:', err);
+        setMicError(err?.message || 'Failed to toggle microphone');
       }
     }
   };
@@ -190,6 +202,30 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
         </button>
       )}
 
+      {/* Microphone Error Warning Banner */}
+      {micError && (
+        <div className="w-full py-3 px-4 bg-red-500/20 border border-red-500/40 text-red-300 rounded-xl flex items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2">
+            <MicOff className="w-4 h-4 text-red-400 shrink-0" />
+            <span>Microphone unavailable: {micError}</span>
+          </div>
+          <button
+            onClick={async (e) => {
+              e.stopPropagation();
+              try {
+                await localParticipant?.setMicrophoneEnabled(true);
+                setMicError('');
+              } catch (err: any) {
+                setMicError(err?.message || 'Failed to enable microphone');
+              }
+            }}
+            className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white font-medium rounded-lg shrink-0 cursor-pointer"
+          >
+            Retry Mic
+          </button>
+        </div>
+      )}
+
       {/* Header Info */}
       <div className="flex items-center justify-between border-b border-slate-850 pb-4">
         <div className="flex items-center gap-3">
@@ -242,11 +278,11 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
             <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
               <div
                 className="bg-emerald-500 h-full transition-all duration-75 rounded-full"
-                style={{ width: `${isMuted ? 0 : Math.max(localVolumePercentage, 5)}%` }}
+                style={{ width: `${isMicMuted ? 0 : Math.max(localVolumePercentage, localMicTrack ? 5 : 0)}%` }}
               ></div>
             </div>
             <span className="text-[11px] font-mono text-slate-400 w-12 text-right">
-              {isMuted ? 'Muted' : `${localVolumePercentage}%`}
+              {isMicMuted ? 'Muted' : !localMicTrack ? 'No Mic' : `${localVolumePercentage}%`}
             </span>
           </div>
         </div>
@@ -301,12 +337,12 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
         <button
           onClick={toggleMute}
           className={`flex-1 min-w-[120px] flex items-center justify-center gap-2 py-2.5 rounded-xl border text-sm font-semibold tracking-wide transition-all cursor-pointer
-            ${isMuted
+            ${isMicMuted
               ? 'bg-red-500/15 border-red-500/30 text-red-400 hover:bg-red-500/20 shadow-red-500/5 shadow-inner'
               : 'bg-slate-800/50 border-slate-700/60 text-slate-200 hover:bg-slate-800 hover:text-white'}`}
         >
-          {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-          <span>{isMuted ? 'Unmute Mic' : 'Mute Mic'}</span>
+          {isMicMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4 text-emerald-400" />}
+          <span>{isMicMuted ? 'Unmute Mic' : 'Mute Mic'}</span>
         </button>
 
         <button
@@ -508,7 +544,39 @@ export function VoiceChat({ initialConnect = false }: { initialConnect?: boolean
     };
   }, [isConnected]);
 
-  const handleConnect = () => {
+  const isSecureOrigin =
+    typeof window !== 'undefined'
+      ? window.isSecureContext ||
+        window.location.hostname === 'localhost' ||
+        window.location.hostname === '127.0.0.1'
+      : true;
+
+  const handleConnect = async () => {
+    setError('');
+
+    // Check mediaDevices support
+    if (typeof navigator !== 'undefined' && (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)) {
+      setError(
+        `Microphone is unavailable: Chrome blocks microphone access on HTTP IP addresses (${window.location.origin}). ` +
+        `To use microphone from another device on your network: in Chrome, go to chrome://flags/#unsafely-treat-insecure-origin-as-secure, ` +
+        `add "${window.location.origin}", set to Enabled, and click Relaunch.`
+      );
+      return;
+    }
+
+    // Explicitly request mic permission during the user gesture click!
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((track) => track.stop());
+    } catch (err: any) {
+      console.error('Microphone access denied:', err);
+      setError(
+        `Microphone access was denied: ${err?.message || 'Permission denied'}. ` +
+        `Please allow microphone access in your browser address bar.`
+      );
+      return;
+    }
+
     setIsConnected(true);
   };
 
@@ -543,6 +611,22 @@ export function VoiceChat({ initialConnect = false }: { initialConnect?: boolean
           <PhoneCall className="w-4 h-4" />
           <span>Connect Voice Assistant</span>
         </button>
+
+        {/* Warning if running in non-secure context on remote browser */}
+        {!isSecureOrigin && (
+          <div className="w-full p-3.5 bg-amber-500/10 border border-amber-500/30 rounded-xl text-left text-xs text-amber-300 flex flex-col gap-1.5">
+            <div className="font-semibold flex items-center gap-1.5">
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>Network IP Notice: Chrome Mic Permission</span>
+            </div>
+            <p className="text-[11px] text-slate-300">
+              You are accessing via <span className="font-mono text-amber-200">{typeof window !== 'undefined' ? window.location.origin : ''}</span>. Chrome blocks microphone access on non-localhost HTTP.
+            </p>
+            <p className="text-[11px] text-slate-300">
+              <strong>To allow mic in Chrome:</strong> Open <span className="font-mono bg-slate-950 px-1 py-0.5 rounded text-amber-200">chrome://flags/#unsafely-treat-insecure-origin-as-secure</span>, add this origin, set to <strong>Enabled</strong>, and relaunch.
+            </p>
+          </div>
+        )}
 
         {/* Wake Word Activation Settings */}
         <div className="w-full border-t border-slate-850/80 pt-5 mt-2 text-left flex flex-col gap-4">
