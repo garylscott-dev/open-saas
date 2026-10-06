@@ -18,7 +18,7 @@ export function VoicePage() {
             Real-time conversational intelligence powered by local STT, LLM, and TTS.
           </p>
         </div>
-        <VoiceChat initialConnect={true} />
+        <VoiceChat initialConnect={false} />
       </div>
     </div>
   );

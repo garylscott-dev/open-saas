@@ -68,7 +68,7 @@ export const getWakeWord: GetWakeWord = async (req, res, context) => {
   try {
     const userContext = (req as any).user;
     if (!userContext) {
-      res.status(401).json({ error: 'Unauthorized' });
+      res.json({ wakeWord: 'hey Jarvis' });
       return;
     }
 

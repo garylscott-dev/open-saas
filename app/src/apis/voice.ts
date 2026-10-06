@@ -1,15 +1,15 @@
 import { type GetVoiceToken } from 'wasp/server/api';
 import { AccessToken } from 'livekit-server-sdk';
 
-export const getVoiceToken: GetVoiceToken = async (req, res, _context) => {
+export const getVoiceToken: GetVoiceToken = async (req, res, context) => {
   try {
     const apiKey = process.env.LIVEKIT_API_KEY || 'devkey';
     const apiSecret = process.env.LIVEKIT_API_SECRET || 'secretsecretsecretsecretsecret1234';
 
-    const userContext = (req as any).user;
-    const userId = userContext?.id || `anon-${Math.floor(Math.random() * 10000)}`;
-    const participantIdentity = `user-${userId}`;
-    const roomName = `voice-room-${userId}`;
+    const userId = context.user?.id || (req as any).user?.id || 'guest';
+    const sessionSuffix = Date.now().toString(36);
+    const participantIdentity = `user-${userId}-${sessionSuffix}`;
+    const roomName = `voice-room-${userId}-${sessionSuffix}`;
     
     const at = new AccessToken(apiKey, apiSecret, {
       identity: participantIdentity,

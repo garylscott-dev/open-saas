@@ -11,12 +11,15 @@ import livekit.rtc as rtc
 from livekit.agents.types import NOT_GIVEN, NotGivenOr, APIConnectOptions, DEFAULT_API_CONNECT_OPTIONS
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm, stt, tts
 from livekit.agents import voice
+from livekit.agents.voice import room_io
 from livekit.plugins import silero, openai
 
 # Load environment variables
 load_dotenv()
 
 WASP_API_URL = os.getenv("WASP_API_URL", "http://localhost:3001")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1")
 
 logger = logging.getLogger("voice-agent")
 logging.basicConfig(level=logging.INFO)
@@ -51,16 +54,42 @@ class LocalWhisperSTT(stt.STT):
         language: NotGivenOr[str | list[str]] = NOT_GIVEN,
         conn_options: APIConnectOptions,
     ) -> stt.SpeechEvent:
-        frame = rtc.combine_audio_frames(buffer)
+        try:
+            frame = rtc.combine_audio_frames(buffer)
+        except Exception as e:
+            logger.error(f"[LocalWhisperSTT] Error combining audio frames: {e}")
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(text="", language="en")],
+            )
+
+        # Faster-whisper expects 16kHz audio. Resample if necessary (e.g. 48kHz WebRTC)
+        if frame.sample_rate != 16000:
+            resampler = rtc.AudioResampler(
+                input_rate=frame.sample_rate,
+                output_rate=16000,
+            )
+            resampled = resampler.push(frame) + resampler.flush()
+            frame = rtc.combine_audio_frames(resampled)
+
         audio_array = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
+        if frame.num_channels > 1:
+            audio_array = audio_array.reshape(-1, frame.num_channels).mean(axis=1)
+
+        if len(audio_array) == 0:
+            return stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                alternatives=[stt.SpeechData(text="", language="en")],
+            )
 
         loop = asyncio.get_running_loop()
         def _transcribe():
-            segments, info = self._model.transcribe(audio_array, beam_size=5)
+            segments, info = self._model.transcribe(audio_array, beam_size=5, vad_filter=False)
             return "".join([segment.text for segment in segments]).strip()
 
         text = await loop.run_in_executor(None, _transcribe)
-        logger.info(f"[LocalWhisperSTT] Transcribed: {text}")
+        if text:
+            logger.info(f"[LocalWhisperSTT] Transcribed: {text}")
 
         return stt.SpeechEvent(
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
@@ -76,7 +105,10 @@ class LocalKokoroTTS(tts.TTS):
         )
         from kokoro_onnx import Kokoro
         logger.info("Loading Kokoro TTS model...")
-        self._kokoro = Kokoro("models/kokoro-v1.0.onnx", "models/voices-v1.0.bin")
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, "models", "kokoro-v1.0.onnx")
+        voices_path = os.path.join(base_dir, "models", "voices-v1.0.bin")
+        self._kokoro = Kokoro(model_path, voices_path)
 
     @property
     def model(self) -> str:
@@ -92,7 +124,7 @@ class LocalKokoroTTS(tts.TTS):
         return KokoroChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
 class KokoroChunkedStream(tts.ChunkedStream):
-    def __init__(self, *, tts: LocalKokoroTTS, input_text: str, conn_options: tts.APIConnectOptions) -> None:
+    def __init__(self, *, tts: LocalKokoroTTS, input_text: str, conn_options: APIConnectOptions) -> None:
         super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
         self._tts = tts
 
@@ -149,7 +181,10 @@ async def entrypoint(ctx: JobContext):
     room_name = ctx.room.name
     user_id = None
     if room_name.startswith("voice-room-"):
-        user_id = room_name.replace("voice-room-", "")
+        raw_id = room_name.replace("voice-room-", "")
+        parts = raw_id.split("-")
+        if parts and parts[0] not in ["guest", "anon"]:
+            user_id = parts[0]
     logger.info(f"Connecting voice pipeline to room: {room_name} for user_id: {user_id}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
@@ -162,11 +197,11 @@ async def entrypoint(ctx: JobContext):
     stt_plugin = stt.StreamAdapter(stt=local_stt, vad=vad_model)
 
     # Local LLM (Ollama)
-    logger.info("Initializing Local Ollama LLM (llama3.2)...")
+    logger.info(f"Initializing Local Ollama LLM ({OLLAMA_MODEL})...")
     llm_plugin = openai.LLM(
-        base_url="http://127.0.0.1:11434/v1",
+        base_url=OLLAMA_BASE_URL,
         api_key="ollama",  # dummy key for compatibility
-        model="llama3.2",
+        model=OLLAMA_MODEL,
     )
 
     # Local TTS (Kokoro)
@@ -200,16 +235,30 @@ async def entrypoint(ctx: JobContext):
 
     # Create the Voice Agent
     agent = voice.Agent(
-        instructions="You are Alpha, a helpful AI voice assistant.",
+        instructions="You are Alpha, a helpful AI voice assistant. Keep your answers concise, natural, and conversational.",
         vad=vad_model,
         stt=stt_plugin,
         llm=llm_plugin,
         tts=tts_plugin,
         chat_ctx=chat_ctx,
+        turn_detection="vad",
     )
 
-    session = voice.AgentSession()
-    await session.start(agent, room=ctx.room)
+    session = voice.AgentSession(
+        vad=vad_model,
+        turn_handling={
+            "turn_detection": "vad",
+            "interruption": {"mode": "vad"},
+        },
+    )
+    await session.start(
+        agent,
+        room=ctx.room,
+        room_input_options=room_io.RoomInputOptions(
+            close_on_disconnect=False,
+            delete_room_on_close=True,
+        ),
+    )
     logger.info("Voice assistant connected and listening!")
 
     # Invoke session started hook
@@ -218,6 +267,9 @@ async def entrypoint(ctx: JobContext):
     # Inactivity Tracking variables
     last_user_activity = time.time()
     is_agent_speaking = False
+
+    # Say a brief greeting to confirm voice output
+    session.say("Hello! How can I help you today?")
 
     # Register event listeners
     @session.on("agent_state_changed")
@@ -306,17 +358,14 @@ async def entrypoint(ctx: JobContext):
                 
                 asyncio.create_task(save_msg_to_db())
 
-    # Monitor room connection status and enforce idle timeout
-    IDLE_TIMEOUT_SECONDS = 45
-    while ctx.room.connection_state == "connected":
-        await asyncio.sleep(1)
-        if is_agent_speaking:
-            last_user_activity = time.time()
-            continue
-        if time.time() - last_user_activity > IDLE_TIMEOUT_SECONDS:
-            logger.info(f"Idle timeout reached ({IDLE_TIMEOUT_SECONDS}s). Disconnecting...")
-            await ctx.room.disconnect()
-            break
+    # Keep session active while room is connected
+    try:
+        while ctx.room.isconnected():
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        logger.info(f"Agent session ended for room: {room_name}")
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

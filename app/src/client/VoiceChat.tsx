@@ -2,12 +2,14 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   LiveKitRoom,
   RoomAudioRenderer,
+  StartAudio,
   useRoomContext,
   useLocalParticipant,
   useTrackVolume,
+  useAudioPlayback,
 } from '@livekit/components-react';
 import { Track, RoomEvent, LocalAudioTrack, RemoteAudioTrack } from 'livekit-client';
-import { Mic, MicOff, RefreshCw, PhoneOff, PhoneCall, Radio, MessageSquare, Volume2, Settings, Sparkles, Check } from 'lucide-react';
+import { Mic, MicOff, RefreshCw, PhoneOff, PhoneCall, Radio, MessageSquare, Volume2, Sparkles, Check, AlertCircle } from 'lucide-react';
 import { useAuth } from 'wasp/client/auth';
 
 interface VoiceDashboardProps {
@@ -18,6 +20,7 @@ interface VoiceDashboardProps {
 function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
   const room = useRoomContext();
   const { localParticipant } = useLocalParticipant();
+  const { canPlayAudio, startAudio } = useAudioPlayback(room);
 
   const [agentState, setAgentState] = useState<'initializing' | 'idle' | 'listening' | 'thinking' | 'speaking'>('idle');
   const [userState, setUserState] = useState<'speaking' | 'listening' | 'away'>('listening');
@@ -26,18 +29,27 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Sync mute state with LiveKit
+  // Auto-enable microphone and unblock audio on connect
   useEffect(() => {
     if (localParticipant) {
-      setIsMuted(localParticipant.isMicrophoneEnabled === false);
+      localParticipant.setMicrophoneEnabled(true).catch((err) => {
+        console.warn('Microphone permission request:', err);
+      });
+      setIsMuted(false);
     }
-  }, [localParticipant]);
+    if (room) {
+      room.startAudio().catch(() => {});
+    }
+  }, [localParticipant, room]);
 
   const toggleMute = async () => {
     if (localParticipant) {
       const targetState = !isMuted;
       await localParticipant.setMicrophoneEnabled(!targetState);
       setIsMuted(targetState);
+      if (room) {
+        await room.startAudio().catch(() => {});
+      }
     }
   };
 
@@ -70,7 +82,7 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
   useEffect(() => {
     if (!room) return;
 
-    const handleData = (payload: Uint8Array, participant?: any, kind?: any, topic?: string) => {
+    const handleData = (payload: Uint8Array, _participant?: any, _kind?: any, _topic?: string) => {
       try {
         const decoder = new TextDecoder();
         const str = decoder.decode(payload);
@@ -93,7 +105,6 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
 
           setTranscripts((prev) => {
             const lastMsg = prev[prev.length - 1];
-            // If the same speaker said the same message recently, avoid duplicate
             if (lastMsg && lastMsg.speaker === data.speaker && lastMsg.text === text) {
               return prev;
             }
@@ -128,7 +139,7 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
 
   const remoteParticipants = Array.from(room.remoteParticipants.values());
   const agentParticipant = remoteParticipants.find(
-    (p) => p.identity.includes('agent') || p.identity.includes('user') || p.identity.includes('user-')
+    (p) => p.identity.startsWith('agent') || (p as any).isAgent
   ) || remoteParticipants[0];
   const agentAudioTrack = agentParticipant?.getTrackPublication(Track.Source.Microphone)?.track;
 
@@ -148,14 +159,37 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
       case 'listening':
         return { text: 'LISTENING', color: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30 shadow-[0_0_10px_rgba(16,185,129,0.1)]', dotClass: 'bg-emerald-400 animate-ping' };
       default:
-        return { text: 'IDLE', color: 'bg-slate-500/20 text-slate-400 border-slate-500/30', dotClass: 'bg-slate-500' };
+        return { text: 'CONNECTED', color: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/30', dotClass: 'bg-indigo-400' };
     }
   };
 
   const badge = getBadgeConfig();
 
   return (
-    <div className="w-full max-w-2xl mx-auto flex flex-col gap-6 p-6 rounded-2xl border border-slate-800/80 bg-slate-900/60 backdrop-blur-xl shadow-2xl">
+    <div
+      onClick={() => {
+        if (!canPlayAudio) {
+          startAudio();
+          room.startAudio().catch(() => {});
+        }
+      }}
+      className="w-full max-w-2xl mx-auto flex flex-col gap-6 p-6 rounded-2xl border border-slate-800/80 bg-slate-900/60 backdrop-blur-xl shadow-2xl"
+    >
+      {/* Audio Playback Warning Banner if browser blocked autoplay */}
+      {!canPlayAudio && (
+        <button
+          onClick={async (e) => {
+            e.stopPropagation();
+            await startAudio();
+            await room.startAudio().catch(() => {});
+          }}
+          className="w-full py-3 px-4 bg-amber-500/20 border border-amber-500/40 text-amber-300 font-semibold rounded-xl flex items-center justify-center gap-2 animate-pulse hover:bg-amber-500/30 transition-all cursor-pointer shadow-lg shadow-amber-500/10"
+        >
+          <Volume2 className="w-5 h-5 text-amber-400" />
+          <span>Click here to enable assistant audio (browser autoplay is paused)</span>
+        </button>
+      )}
+
       {/* Header Info */}
       <div className="flex items-center justify-between border-b border-slate-850 pb-4">
         <div className="flex items-center gap-3">
@@ -179,10 +213,9 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
           ${agentState === 'speaking' ? 'bg-gradient-to-tr from-purple-600 to-indigo-600 ring-8 ring-purple-500/20 scale-110 shadow-purple-500/40' :
             agentState === 'thinking' ? 'bg-gradient-to-tr from-cyan-600 to-blue-600 ring-8 ring-cyan-500/20 animate-pulse shadow-cyan-500/40' :
             agentState === 'listening' ? 'bg-gradient-to-tr from-emerald-600 to-teal-600 ring-8 ring-emerald-500/20 scale-105 shadow-emerald-500/40' :
-            'bg-gradient-to-tr from-slate-700 to-slate-800 shadow-slate-500/20'}`}
+            'bg-gradient-to-tr from-indigo-700 to-slate-800 shadow-indigo-500/20'}`}
         >
           <Radio className={`w-12 h-12 text-white opacity-85 ${agentState === 'speaking' ? 'animate-bounce' : agentState === 'thinking' ? 'animate-spin' : ''}`} />
-          {/* Animated ripple rings */}
           {agentState === 'speaking' && (
             <>
               <div className="absolute inset-0 rounded-full bg-purple-500/10 animate-ping -z-10 duration-1000"></div>
@@ -195,9 +228,9 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
         </div>
         <p className="mt-4 text-xs font-medium tracking-wide text-slate-400 transition-all">
           {agentState === 'speaking' ? 'Agent is speaking...' :
-           agentState === 'thinking' ? 'Agent is formulating a response...' :
-           agentState === 'listening' ? 'Listening... Go ahead, ask anything!' :
-           'Waiting...'}
+           agentState === 'thinking' ? 'Agent is thinking...' :
+           agentState === 'listening' ? 'Listening to your voice... Speak now!' :
+           'Assistant connected and ready.'}
         </p>
       </div>
 
@@ -209,24 +242,24 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
             <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
               <div
                 className="bg-emerald-500 h-full transition-all duration-75 rounded-full"
-                style={{ width: `${isMuted ? 0 : localVolumePercentage}%` }}
+                style={{ width: `${isMuted ? 0 : Math.max(localVolumePercentage, 5)}%` }}
               ></div>
             </div>
-            <span className="text-[11px] font-mono text-slate-400 w-8 text-right">
+            <span className="text-[11px] font-mono text-slate-400 w-12 text-right">
               {isMuted ? 'Muted' : `${localVolumePercentage}%`}
             </span>
           </div>
         </div>
         <div className="flex flex-col gap-1.5 text-left">
-          <span className="text-[11px] font-bold text-slate-400 tracking-wider uppercase">Agent Level</span>
+          <span className="text-[11px] font-bold text-slate-400 tracking-wider uppercase">Agent Voice Level</span>
           <div className="flex items-center gap-2">
             <div className="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
               <div
                 className="bg-purple-500 h-full transition-all duration-75 rounded-full"
-                style={{ width: `${agentVolumePercentage}%` }}
+                style={{ width: `${Math.max(agentVolumePercentage, agentState === 'speaking' ? 40 : 0)}%` }}
               ></div>
             </div>
-            <span className="text-[11px] font-mono text-slate-400 w-8 text-right">{agentVolumePercentage}%</span>
+            <span className="text-[11px] font-mono text-slate-400 w-12 text-right">{agentVolumePercentage}%</span>
           </div>
         </div>
       </div>
@@ -240,7 +273,7 @@ function VoiceDashboard({ onDisconnect, onReconnect }: VoiceDashboardProps) {
         <div className="w-full h-48 overflow-y-auto rounded-xl border border-slate-800/60 bg-slate-950/70 p-4 flex flex-col gap-3 scrollbar-thin">
           {transcripts.length === 0 ? (
             <div className="h-full flex items-center justify-center text-slate-500 text-xs italic">
-              Speak or wait for the agent to start the conversation...
+              Say something like "Hello, what can you do?"...
             </div>
           ) : (
             transcripts.map((msg) => (
@@ -426,24 +459,16 @@ export function VoiceChat({ initialConnect = false }: { initialConnect?: boolean
     };
   }, [isConnected, isWakeWordActive, wakeWord]);
 
-  // Dynamically resolve server URLs based on current browser location
-  const getDynamicApiUrl = () => {
-    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-      return `http://localhost:3001`;
-    }
-    const envUrl = import.meta.env.REACT_APP_API_URL;
-    if (envUrl) return envUrl;
-    return `${window.location.protocol}//${window.location.hostname}:3001`;
-  };
-
   const getDynamicLiveKitUrl = () => {
-    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-      return `ws://localhost:7880`;
+    if (typeof window !== 'undefined') {
+      if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+        return `ws://localhost:7880`;
+      }
+      return `ws://${window.location.hostname}:7880`;
     }
-    return `ws://${window.location.hostname}:7880`;
+    return `ws://localhost:7880`;
   };
 
-  const apiBaseUrl = getDynamicApiUrl();
   const liveKitUrl = getDynamicLiveKitUrl();
 
   useEffect(() => {
@@ -481,7 +506,7 @@ export function VoiceChat({ initialConnect = false }: { initialConnect?: boolean
     return () => {
       isMounted = false;
     };
-  }, [isConnected, apiBaseUrl]);
+  }, [isConnected]);
 
   const handleConnect = () => {
     setIsConnected(true);
@@ -580,8 +605,11 @@ export function VoiceChat({ initialConnect = false }: { initialConnect?: boolean
   if (error) {
     return (
       <div className="w-full max-w-md mx-auto flex flex-col items-center justify-center p-6 rounded-2xl border border-red-950 bg-red-950/20 backdrop-blur-xl shadow-2xl text-center gap-4">
-        <div className="text-red-400 text-sm font-semibold">Connection Error</div>
-        <div className="text-xs text-red-500 max-w-xs">{error}</div>
+        <div className="text-red-400 text-sm font-semibold flex items-center justify-center gap-1.5">
+          <AlertCircle className="w-4 h-4 text-red-400" />
+          <span>Connection Error</span>
+        </div>
+        <div className="text-xs text-red-400 max-w-xs">{error}</div>
         <button
           onClick={handleDisconnect}
           className="px-4 py-2 bg-slate-800 text-slate-200 text-xs font-semibold rounded-lg hover:bg-slate-700 transition-all cursor-pointer"
@@ -610,10 +638,11 @@ export function VoiceChat({ initialConnect = false }: { initialConnect?: boolean
       connect={true}
       audio={true}
       video={false}
-      className="flex flex-col items-center justify-center gap-4"
+      className="flex flex-col items-center justify-center gap-4 w-full"
     >
       <VoiceDashboard onDisconnect={handleDisconnect} onReconnect={handleReconnect} />
       <RoomAudioRenderer />
+      <StartAudio label="Click to allow audio" />
     </LiveKitRoom>
   );
 }
