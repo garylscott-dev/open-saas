@@ -25,7 +25,7 @@ logger = logging.getLogger("voice-agent")
 logging.basicConfig(level=logging.INFO)
 
 class LocalWhisperSTT(stt.STT):
-    def __init__(self):
+    def __init__(self, model_name: str | None = None):
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=False,
@@ -36,12 +36,22 @@ class LocalWhisperSTT(stt.STT):
             )
         )
         from faster_whisper import WhisperModel
-        logger.info("Loading faster-whisper base model on CPU...")
-        self._model = WhisperModel("base", device="cpu", compute_type="int8")
+        self._model_name = model_name or os.getenv("WHISPER_MODEL", "small.en")
+        logger.info(f"Loading faster-whisper model '{self._model_name}' on CPU...")
+        try:
+            self._model = WhisperModel(self._model_name, device="cpu", compute_type="int8")
+        except Exception as e:
+            logger.warning(f"Failed to load model '{self._model_name}': {e}. Falling back to 'base.en'...")
+            self._model_name = "base.en"
+            try:
+                self._model = WhisperModel("base.en", device="cpu", compute_type="int8")
+            except Exception:
+                self._model_name = "base"
+                self._model = WhisperModel("base", device="cpu", compute_type="int8")
 
     @property
     def model(self) -> str:
-        return "faster-whisper-base"
+        return f"faster-whisper-{self._model_name}"
 
     @property
     def provider(self) -> str:
@@ -63,18 +73,29 @@ class LocalWhisperSTT(stt.STT):
                 alternatives=[stt.SpeechData(text="", language="en")],
             )
 
-        # Faster-whisper expects 16kHz audio. Resample if necessary (e.g. 48kHz WebRTC)
+        # 1. Downmix multi-channel audio to mono if needed
+        if frame.num_channels > 1:
+            arr = np.frombuffer(frame.data, dtype=np.int16).reshape(-1, frame.num_channels)
+            mono_int16 = arr.mean(axis=1).astype(np.int16)
+            frame = rtc.AudioFrame(
+                data=mono_int16.tobytes(),
+                sample_rate=frame.sample_rate,
+                num_channels=1,
+                samples_per_channel=len(mono_int16),
+            )
+
+        # 2. Resample to 16000 Hz if necessary (faster-whisper strictly expects 16kHz mono)
         if frame.sample_rate != 16000:
             resampler = rtc.AudioResampler(
                 input_rate=frame.sample_rate,
                 output_rate=16000,
+                quality=rtc.AudioResamplerQuality.HIGH,
             )
-            resampled = resampler.push(frame) + resampler.flush()
-            frame = rtc.combine_audio_frames(resampled)
+            resampled_frames = resampler.push(frame) + resampler.flush()
+            if resampled_frames:
+                frame = rtc.combine_audio_frames(resampled_frames)
 
         audio_array = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
-        if frame.num_channels > 1:
-            audio_array = audio_array.reshape(-1, frame.num_channels).mean(axis=1)
 
         if len(audio_array) == 0:
             return stt.SpeechEvent(
@@ -84,8 +105,16 @@ class LocalWhisperSTT(stt.STT):
 
         loop = asyncio.get_running_loop()
         def _transcribe():
-            segments, info = self._model.transcribe(audio_array, beam_size=5, vad_filter=False)
-            return "".join([segment.text for segment in segments]).strip()
+            segments, info = self._model.transcribe(
+                audio_array,
+                language="en",
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=400),
+                condition_on_previous_text=False,
+                temperature=0.0,
+            )
+            return " ".join([segment.text.strip() for segment in segments if segment.text.strip()]).strip()
 
         text = await loop.run_in_executor(None, _transcribe)
         if text:
@@ -95,6 +124,22 @@ class LocalWhisperSTT(stt.STT):
             type=stt.SpeechEventType.FINAL_TRANSCRIPT,
             alternatives=[stt.SpeechData(text=text, language="en")],
         )
+
+# Module-level singleton caches to keep model weights warm in memory
+_shared_stt: LocalWhisperSTT | None = None
+_shared_tts: "LocalKokoroTTS | None" = None
+
+def get_shared_stt() -> LocalWhisperSTT:
+    global _shared_stt
+    if _shared_stt is None:
+        _shared_stt = LocalWhisperSTT()
+    return _shared_stt
+
+def get_shared_tts() -> "LocalKokoroTTS":
+    global _shared_tts
+    if _shared_tts is None:
+        _shared_tts = LocalKokoroTTS()
+    return _shared_tts
 
 class LocalKokoroTTS(tts.TTS):
     def __init__(self):
@@ -193,7 +238,7 @@ async def entrypoint(ctx: JobContext):
 
     # Local STT (Whisper via StreamAdapter)
     logger.info("Initializing Local Whisper STT...")
-    local_stt = LocalWhisperSTT()
+    local_stt = get_shared_stt()
     stt_plugin = stt.StreamAdapter(stt=local_stt, vad=vad_model)
 
     # Local LLM (Ollama)
@@ -206,7 +251,7 @@ async def entrypoint(ctx: JobContext):
 
     # Local TTS (Kokoro)
     logger.info("Initializing Local Kokoro TTS...")
-    tts_plugin = LocalKokoroTTS()
+    tts_plugin = get_shared_tts()
 
     chat_ctx = llm.ChatContext()
     chat_ctx.add_message(
