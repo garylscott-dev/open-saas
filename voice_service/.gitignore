@@ -1,0 +1,15 @@
+# Python virtualenv and cache
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Environment secrets
+.env
+
+# Large binaries and model weights (>100MB, cannot be pushed to GitHub)
+bin/
+models/
